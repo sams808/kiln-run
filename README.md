@@ -14,6 +14,12 @@ followed at once; opening the address with no fragment lists them. Runs are
 held in the browser's local storage on that device alone and are forgotten
 a day after they finish.
 
+The stickers on the furnaces themselves carry `?f=<id>` instead of a
+fragment. That form reads the furnace's current run from
+[kiln-board](https://github.com/sams808/kiln-board) — a public repository,
+so no key and no account — and keeps it up to date while the page is open,
+falling back to the last reading when there is no signal.
+
 The page is a single file with no dependencies and no network requests of
 any kind, so it keeps working with no signal once it has loaded — which is
 the point, for a program that runs overnight.

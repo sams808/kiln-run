@@ -94,6 +94,9 @@
   button.link { border: 0; background: none; color: var(--cool); padding: 4px 0; }
   button.x { border: 0; background: none; color: var(--muted);
              font-size: 1.3rem; line-height: 1; padding: 0 4px; }
+  .note { margin-top: 8px; padding: 8px 10px; border-radius: 9px;
+          background: var(--bg); font-size: .9rem; }
+  a.book { color: var(--cool); text-decoration: none; font-size: .9rem; }
   .warn { color: var(--hot); }
   .empty { text-align: center; color: var(--muted); padding: 40px 12px; }
 </style>
@@ -125,6 +128,49 @@ function idOf(text) {
   return (h >>> 0).toString(36);
 }
 
+// ------------------------------------------------------------------ board
+// A furnace sticker carries ?f=<id>. The files are read straight from the
+// repository: public, CDN-cached, no key and no account. A cache-buster
+// keeps the CDN from serving a run that has since been republished.
+const BOARD = "https://raw.githubusercontent.com/sams808/kiln-board/main";
+const REFETCH_MS = 60000;
+
+async function getJson(path) {
+  const response = await fetch(`${BOARD}/${path}?t=${Date.now()}`, { cache: "no-store" });
+  if (response.status === 404) return null;          // furnace never published
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return await response.json();
+}
+
+async function fetchFurnaceList() {
+  const data = await getJson("furnaces.json");
+  return (data && data.furnaces) || [];
+}
+
+async function fetchFurnace(id) {
+  const [list, state] = await Promise.all([
+    fetchFurnaceList().catch(() => []),
+    getJson(`furnaces/${id}.json`),
+  ]);
+  const listed = list.find(f => f.id === id);
+  return {
+    kind: "furnace",
+    id,
+    name: (state && state.name) || (listed && listed.name) || id,
+    nemo: (listed && listed.nemo_url) || "",
+    by: (state && state.by) || "",
+    at: (state && state.at) || 0,
+    note: (state && state.note) || "",
+    run: (state && state.run) || null,
+    fetchedAt: Date.now() / 1000,
+  };
+}
+
+// The fingerprint of a published run, so a republish can be told from a
+// refetch: the local "actually started at" belongs to one run, not to the
+// furnace, and must not be carried over onto somebody else's new one.
+const runKeyOf = run => run ? idOf(JSON.stringify(run)) : "";
+
 // ---------------------------------------------------------------- storage
 // Best effort throughout: localStorage throws on a file:// page and in some
 // private modes, and a run you just scanned must still be readable then.
@@ -140,14 +186,19 @@ function writeLibrary() {
   try { localStorage.setItem(KEY, JSON.stringify(LIBRARY)); } catch (e) { /* this visit only */ }
 }
 const startOf = entry => (entry.offset || entry.run.t0) * 1000;
+const isLive = entry => entry.kind === "furnace";
 
 function forgetStale() {
   const now = Date.now() / 1000;
   let changed = false;
   for (const [id, entry] of Object.entries(LIBRARY)) {
+    if (!entry.run) continue;                 // an idle furnace stays listed
     const total = entry.run.p[entry.run.p.length - 1][0];
     const ended = startOf(entry) / 1000 + total * 60;
-    if (now - ended > FORGET_AFTER_MIN * 60) { delete LIBRARY[id]; changed = true; }
+    // A furnace is a standing subscription; only scanned snapshots age out.
+    if (!isLive(entry) && now - ended > FORGET_AFTER_MIN * 60) {
+      delete LIBRARY[id]; changed = true;
+    }
   }
   if (changed) writeLibrary();
 }
@@ -275,17 +326,25 @@ function libraryView() {
       <p>No runs yet.</p>
       <p class="sub">Scan the code KILN shows under<br><b>File ▸ Follow on your phone</b>.</p></div>`;
   }
-  const entries = ids.map(id => ({ id, st: stateOf(LIBRARY[id]) }));
-  // Soonest to finish first; the finished ones sink to the bottom.
-  entries.sort((a, b) => (a.st.phase === "done") - (b.st.phase === "done") || a.st.end - b.st.end);
+  const entries = ids.map(id => ({ id, entry: LIBRARY[id], st: LIBRARY[id].run ? stateOf(LIBRARY[id]) : null }));
+  // Soonest to finish first; idle furnaces and finished runs sink down.
+  entries.sort((a, b) =>
+    (!a.st) - (!b.st)
+    || (a.st ? (a.st.phase === "done") - (b.st.phase === "done") || a.st.end - b.st.end : 0));
 
   const now = new Date();
-  const cards = entries.map(({ id, st }) => `
+  const cards = entries.map(({ id, entry, st }) => st === null ? `
+    <div class="card tap done" data-open="${id}">
+      <div class="row">
+        <div><h1>${escape(entry.name || id)}</h1>
+          <div class="sub">Nothing published</div></div>
+      </div>
+    </div>` : `
     <div class="card tap ${st.phase === "done" ? "done" : ""}" data-open="${id}">
       <div class="row">
         <div>
-          <h1>${escape(st.run.n || "Furnace program")}</h1>
-          <div class="sub">${escape(headline(st))}</div>
+          <h1>${escape(isLive(entry) ? entry.name : (st.run.n || "Furnace program"))}</h1>
+          <div class="sub">${escape(isLive(entry) && st.run.n ? st.run.n + " · " : "")}${escape(headline(st))}</div>
         </div>
         <div class="setpoint small">${fmtC(st.setpoint)}</div>
       </div>
@@ -303,9 +362,38 @@ function libraryView() {
       after they finish. Open one to remove it sooner.</div>`;
 }
 
+function furnaceHeader(entry) {
+  if (!isLive(entry)) return "";
+  const published = entry.at
+    ? `${escape(entry.by || "someone")} · published ${clockWithDay(new Date(entry.at * 1000), new Date())}`
+    : "never published";
+  const stale = entry.fetchedAt && (Date.now() / 1000 - entry.fetchedAt) > 300
+    ? ` · shown from ${clockWithDay(new Date(entry.fetchedAt * 1000), new Date())}, no connection` : "";
+  return `<div class="card">
+      <h1>${escape(entry.name || entry.id)}</h1>
+      <div class="sub">${published}${stale}</div>
+      ${entry.note ? `<div class="note">${escape(entry.note)}</div>` : ""}
+      ${entry.nemo ? `<div style="margin-top:10px">
+         <a class="book" href="${escape(entry.nemo)}" target="_blank" rel="noopener">Book this furnace ↗</a></div>` : ""}
+    </div>`;
+}
+
+function idleFurnaceView(id) {
+  const entry = LIBRARY[id];
+  const count = Object.keys(LIBRARY).length;
+  return `<div class="row" style="margin-bottom:10px">
+      <button class="link" data-all="1">← All${count > 1 ? " (" + count + ")" : ""}</button>
+      <button class="x" data-remove="${id}" title="Stop following">×</button>
+    </div>
+    ${furnaceHeader(entry)}
+    <div class="card empty"><p>Nothing published for this furnace.</p>
+      <p class="sub">Whoever starts a run publishes it from KILN.</p></div>`;
+}
+
 function runView(id) {
   const entry = LIBRARY[id];
   if (!entry) { VIEW = { mode: "library" }; return libraryView(); }
+  if (!entry.run) return idleFurnaceView(id);
   const st = stateOf(entry);
   const run = st.run;
 
@@ -339,9 +427,11 @@ function runView(id) {
   const count = Object.keys(LIBRARY).length;
   return `
     <div class="row" style="margin-bottom:10px">
-      <button class="link" data-all="1">← All runs${count > 1 ? " (" + count + ")" : ""}</button>
-      <button class="x" data-remove="${id}" title="Remove this run">×</button>
+      <button class="link" data-all="1">← All${count > 1 ? " (" + count + ")" : ""}</button>
+      <button class="x" data-remove="${id}" title="${isLive(entry) ? "Stop following" : "Remove this run"}">×</button>
     </div>
+
+    ${furnaceHeader(entry)}
 
     <div class="card">
       <h1>${escape(run.n || "Furnace program")}</h1>
@@ -421,11 +511,45 @@ function fail(message) {
      <p class="sub">Open the link from KILN again, or rescan the code.</p></div>`;
 }
 
+// Refresh every furnace being followed. A failure is not an error: the
+// last fetch is still on screen, and the header says how old it is.
+async function refreshFurnaces() {
+  const ids = Object.keys(LIBRARY).filter(id => isLive(LIBRARY[id]));
+  if (!ids.length) return;
+  let changed = false;
+  await Promise.all(ids.map(async id => {
+    let fresh;
+    try { fresh = await fetchFurnace(id); } catch (e) { return; }
+    const was = LIBRARY[id] || {};
+    // A republish is a different run: the local start correction belonged
+    // to the old one and must not be carried onto this.
+    const key = runKeyOf(fresh.run);
+    fresh.offset = key && key === was.runKey ? (was.offset || null) : null;
+    fresh.runKey = key;
+    LIBRARY[id] = fresh;
+    changed = true;
+  }));
+  if (changed) { writeLibrary(); render(); }
+}
+
+async function followFurnace(id) {
+  const known = LIBRARY[id];
+  if (!known) {                      // show something at once, then refresh
+    LIBRARY[id] = { kind: "furnace", id, name: id, run: null, offset: null,
+                    by: "", at: 0, note: "", nemo: "", fetchedAt: 0 };
+  }
+  VIEW = { mode: "run", id };
+  render();
+  await refreshFurnaces();
+}
+
 (async function start() {
   LIBRARY = readLibrary();
   forgetStale();
 
+  const furnaceId = new URLSearchParams(location.search).get("f");
   const fragment = location.hash;
+
   if (fragment && fragment.length > 1) {
     let run;
     try { run = await decodeFragment(fragment); }
@@ -434,13 +558,22 @@ function fail(message) {
     if (run.v !== 1) return fail("This link was made by a newer version of KILN.");
 
     const id = idOf(fragment.replace(/^#/, ""));
-    LIBRARY[id] = { run, offset: (LIBRARY[id] || {}).offset || null, added: Date.now() / 1000 };
+    LIBRARY[id] = { kind: "run", id, run, offset: (LIBRARY[id] || {}).offset || null,
+                    runKey: runKeyOf(run), added: Date.now() / 1000 };
     writeLibrary();
     VIEW = { mode: "run", id };
+  } else if (furnaceId) {
+    await followFurnace(furnaceId);
   }
 
   render();
   setInterval(render, 1000);
+  setInterval(refreshFurnaces, REFETCH_MS);
+  // Coming back to the page is exactly when a stale reading matters.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshFurnaces();
+  });
+  if (!furnaceId) refreshFurnaces();
 })();
 </script>
 </body>
