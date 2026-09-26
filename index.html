@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>KILN runs</title>
+<!--
+  The KILN run viewer.
+
+  Everything it draws comes from the URL fragment, which the browser never
+  sends anywhere: this page is public, the runs are not. It makes no
+  network requests of any kind, so once it has loaded it keeps working
+  with no signal - which is the point, for a program that runs overnight.
+
+  Scanning a code adds that run to a list kept on this device, so several
+  furnaces can be followed at once; the bare address (no #) opens the
+  list. Nothing is ever uploaded, and finished runs are forgotten after a
+  day.
+
+  It holds no timing logic beyond comparing the clock to a table KILN
+  already worked out, and interpolating between two points of the profile.
+-->
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --ink: #14161a; --muted: #5d6068;
+    --line: #e2e2de; --hot: #eb6834; --cool: #2a78d6; --ok: #008300;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 6px 16px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --card: #1d2026; --ink: #f2f3f5; --muted: #9ba1ad;
+      --line: #2c313a; --hot: #ef7e46; --cool: #5c9ef0; --ok: #4fb14f;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+    background: var(--bg); color: var(--ink);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 16px; margin-bottom: 12px; box-shadow: var(--shadow);
+  }
+  .card.tap { cursor: pointer; }
+  .card.done { opacity: .62; }
+  h1 { font-size: 1.15rem; margin: 0 0 2px; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
+       color: var(--muted); margin: 4px 4px 8px; }
+  .sub { color: var(--muted); font-size: .85rem; }
+  .phase { font-size: 1.3rem; font-weight: 650; margin: 0; }
+  .setpoint { font-size: 2.6rem; font-weight: 700; line-height: 1.1;
+              letter-spacing: -.02em; white-space: nowrap; }
+  .setpoint.small { font-size: 1.5rem; }
+  /* A flex child will not shrink below its min-content width unless told to,
+     which is what pushes a long step name and a big number off a phone. */
+  .row { display: flex; flex-wrap: wrap; align-items: baseline;
+         justify-content: space-between; gap: 4px 12px; }
+  .row > * { min-width: 0; overflow-wrap: anywhere; }
+  .row > .setpoint { flex: 0 0 auto; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line);
+         overflow: hidden; margin: 12px 0 8px; }
+  .bar.thin { height: 4px; margin: 10px 0 6px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--hot); transition: width .4s; }
+  .bar > i.done { background: var(--ok); }
+  .bar > i.waiting { background: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th { text-align: left; font-weight: 600; color: var(--muted); font-size: .75rem;
+       text-transform: uppercase; letter-spacing: .04em; padding-bottom: 6px; }
+  td { padding: 7px 0; border-top: 1px solid var(--line); vertical-align: top;
+       overflow-wrap: anywhere; }
+  td:first-child, th:first-child { width: 99%; }
+  td.r, th.r { text-align: right; white-space: nowrap; padding-left: 14px; }
+  tr.now td { font-weight: 650; }
+  tr.now td:first-child { box-shadow: inset 3px 0 var(--hot); padding-left: 9px; }
+  tr.past td { color: var(--muted); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+         margin-right: 7px; vertical-align: baseline; }
+  svg { display: block; width: 100%; height: auto; }
+  label { font-size: .85rem; color: var(--muted); display: block; margin-bottom: 6px; }
+  input[type=datetime-local] {
+    font: inherit; font-size: .95rem; padding: 8px 10px; width: 100%;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg); color: var(--ink);
+  }
+  button {
+    font: inherit; font-size: .9rem; padding: 8px 12px;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg); color: var(--ink); cursor: pointer;
+  }
+  button.link { border: 0; background: none; color: var(--cool); padding: 4px 0; }
+  button.x { border: 0; background: none; color: var(--muted);
+             font-size: 1.3rem; line-height: 1; padding: 0 4px; }
+  .warn { color: var(--hot); }
+  .empty { text-align: center; color: var(--muted); padding: 40px 12px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="empty">Loading…</div></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- payload
+async function decodeFragment(fragment) {
+  let s = decodeURIComponent(fragment.replace(/^#/, "")).trim();
+  if (!s) return null;
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  s += "=".repeat((4 - (s.length % 4)) % 4);
+  const bytes = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  // The payload is raw zlib; DecompressionStream does it without a library.
+  return await new Response(
+    new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"))
+  ).json();
+}
+
+// A stable id per distinct run, so rescanning the same code is idempotent
+// while a second furnace running the same program is its own entry.
+function idOf(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
+}
+
+// ---------------------------------------------------------------- storage
+// Best effort throughout: localStorage throws on a file:// page and in some
+// private modes, and a run you just scanned must still be readable then.
+const KEY = "kiln.runs.v1";
+const FORGET_AFTER_MIN = 24 * 60;
+
+let LIBRARY = {};
+
+function readLibrary() {
+  try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; }
+}
+function writeLibrary() {
+  try { localStorage.setItem(KEY, JSON.stringify(LIBRARY)); } catch (e) { /* this visit only */ }
+}
+const startOf = entry => (entry.offset || entry.run.t0) * 1000;
+
+function forgetStale() {
+  const now = Date.now() / 1000;
+  let changed = false;
+  for (const [id, entry] of Object.entries(LIBRARY)) {
+    const total = entry.run.p[entry.run.p.length - 1][0];
+    const ended = startOf(entry) / 1000 + total * 60;
+    if (now - ended > FORGET_AFTER_MIN * 60) { delete LIBRARY[id]; changed = true; }
+  }
+  if (changed) writeLibrary();
+}
+
+// ---------------------------------------------------------------- helpers
+const pad = n => String(n).padStart(2, "0");
+const fmtC = c => Math.round(c) + " °C";
+const escape = s => String(s).replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function clockOf(date) { return pad(date.getHours()) + ":" + pad(date.getMinutes()); }
+
+function dayShift(date, ref) {
+  const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const b = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate());
+  return Math.round((a - b) / 86400000);
+}
+
+function clockWithDay(date, ref) {
+  const d = dayShift(date, ref);
+  return clockOf(date) + (d > 0 ? ` (+${d} d)` : d < 0 ? ` (${d} d)` : "");
+}
+
+function duration(minutes) {
+  const total = Math.round(Math.abs(minutes));
+  const days = Math.floor(total / 1440);
+  const hours = Math.floor((total % 1440) / 60);
+  const mins = total % 60;
+  const sign = minutes < 0 ? "-" : "";
+  if (days) return `${sign}${days} d ${pad(hours)} h ${pad(mins)} min`;
+  if (hours) return `${sign}${hours} h ${pad(mins)} min`;
+  return `${sign}${mins} min`;
+}
+
+function setpointAt(profile, minutes) {
+  if (minutes <= profile[0][0]) return profile[0][1];
+  const last = profile[profile.length - 1];
+  if (minutes >= last[0]) return last[1];
+  for (let i = 1; i < profile.length; i++) {
+    const [t0, c0] = profile[i - 1], [t1, c1] = profile[i];
+    if (minutes <= t1) {
+      if (t1 === t0) return c1;                      // a quench: vertical
+      return c0 + (c1 - c0) * ((minutes - t0) / (t1 - t0));
+    }
+  }
+  return last[1];
+}
+
+function stateOf(entry) {
+  const run = entry.run;
+  const start = new Date(startOf(entry));
+  const total = run.p[run.p.length - 1][0];
+  const elapsed = (Date.now() - start) / 60000;
+  const end = new Date(start.getTime() + total * 60000);
+  let phase = "hold", step = null, stepEnd = null;
+  if (elapsed < 0) phase = "waiting";
+  else if (elapsed >= total) { phase = "done"; step = run.s.length - 1; }
+  else {
+    for (let i = 0; i < run.s.length; i++) {
+      const [t0, tRamp, t1] = run.s[i];
+      if (elapsed < t1) { phase = elapsed < tRamp ? "ramp" : "hold"; step = i; stepEnd = t1; break; }
+    }
+  }
+  const setpoint = phase === "waiting" ? run.p[0][1] : setpointAt(run.p, elapsed);
+  return { run, start, end, total, elapsed, phase, step, stepEnd, setpoint,
+           fraction: Math.max(0, Math.min(1, elapsed / (total || 1))) };
+}
+
+function headline(st) {
+  if (st.phase === "waiting") return "Starts in " + duration(-st.elapsed);
+  if (st.phase === "done") return "Finished";
+  const step = st.run.s[st.step];
+  return (st.phase === "ramp" ? "Ramping to " : "Holding at ") + fmtC(step[3])
+    + (step[4] ? " — " + step[4] : "");
+}
+
+const barClass = st => st.phase === "done" ? "done" : st.phase === "waiting" ? "waiting" : "";
+
+// ------------------------------------------------------------------- draw
+function profileSvg(run, elapsed) {
+  const W = 520, H = 200, L = 44, R = 12, T = 14, B = 26;
+  const pts = run.p;
+  const total = pts[pts.length - 1][0] || 1;
+  const temps = pts.map(p => p[1]);
+  let lo = Math.min(...temps), hi = Math.max(...temps);
+  const padT = (hi - lo) * 0.12 || 10;
+  lo -= padT; hi += padT;
+  const x = t => L + (t / total) * (W - L - R);
+  const y = c => T + (1 - (c - lo) / (hi - lo)) * (H - T - B);
+  const path = pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1)).join(" ");
+
+  const marks = run.f.filter(f => f[0] >= 0 && f[0] <= total).map(f =>
+    `<circle cx="${x(f[0]).toFixed(1)}" cy="${y(setpointAt(pts, f[0])).toFixed(1)}" r="4.5"
+             fill="${f[2] || "var(--cool)"}" stroke="var(--card)" stroke-width="1.5"/>`).join("");
+
+  const now = (elapsed >= 0 && elapsed <= total)
+    ? `<line x1="${x(elapsed).toFixed(1)}" y1="${T}" x2="${x(elapsed).toFixed(1)}" y2="${H - B}"
+             stroke="var(--cool)" stroke-width="2" stroke-dasharray="5 3"/>
+       <circle cx="${x(elapsed).toFixed(1)}" cy="${y(setpointAt(pts, elapsed)).toFixed(1)}" r="4.5"
+               fill="var(--cool)" stroke="var(--card)" stroke-width="1.5"/>` : "";
+
+  const ticks = [lo + padT, hi - padT].map(c =>
+    `<text x="${L - 8}" y="${(y(c) + 4).toFixed(1)}" text-anchor="end"
+           font-size="11" fill="var(--muted)">${Math.round(c)}</text>`).join("");
+
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Temperature profile">
+    <line x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}" stroke="var(--line)"/>
+    <line x1="${L}" y1="${T}" x2="${L}" y2="${H - B}" stroke="var(--line)"/>
+    ${ticks}
+    <text x="${L}" y="${H - 8}" font-size="11" fill="var(--muted)">start</text>
+    <text x="${W - R}" y="${H - 8}" font-size="11" fill="var(--muted)" text-anchor="end">end</text>
+    <path d="${path}" fill="none" stroke="var(--hot)" stroke-width="2.5"
+          stroke-linejoin="round" stroke-linecap="round"/>
+    ${marks}${now}
+  </svg>`;
+}
+
+// ------------------------------------------------------------------ views
+let VIEW = { mode: "library" };
+
+function libraryView() {
+  const ids = Object.keys(LIBRARY);
+  if (!ids.length) {
+    return `<div class="card empty">
+      <p>No runs yet.</p>
+      <p class="sub">Scan the code KILN shows under<br><b>File ▸ Follow on your phone</b>.</p></div>`;
+  }
+  const entries = ids.map(id => ({ id, st: stateOf(LIBRARY[id]) }));
+  // Soonest to finish first; the finished ones sink to the bottom.
+  entries.sort((a, b) => (a.st.phase === "done") - (b.st.phase === "done") || a.st.end - b.st.end);
+
+  const now = new Date();
+  const cards = entries.map(({ id, st }) => `
+    <div class="card tap ${st.phase === "done" ? "done" : ""}" data-open="${id}">
+      <div class="row">
+        <div>
+          <h1>${escape(st.run.n || "Furnace program")}</h1>
+          <div class="sub">${escape(headline(st))}</div>
+        </div>
+        <div class="setpoint small">${fmtC(st.setpoint)}</div>
+      </div>
+      <div class="bar thin"><i class="${barClass(st)}" style="width:${(st.fraction * 100).toFixed(1)}%"></i></div>
+      <div class="row sub">
+        <span>${st.phase === "done" ? duration(st.elapsed - st.total) + " ago"
+                 : st.phase === "waiting" ? "starts " + clockWithDay(st.start, now)
+                 : duration(st.total - st.elapsed) + " left"}</span>
+        <span>ends ${clockWithDay(st.end, now)}</span>
+      </div>
+    </div>`).join("");
+
+  return `<h2>${entries.length} run${entries.length !== 1 ? "s" : ""}</h2>${cards}
+    <div class="card sub">Runs live on this device only, and are forgotten a day
+      after they finish. Open one to remove it sooner.</div>`;
+}
+
+function runView(id) {
+  const entry = LIBRARY[id];
+  if (!entry) { VIEW = { mode: "library" }; return libraryView(); }
+  const st = stateOf(entry);
+  const run = st.run;
+
+  let detail;
+  if (st.phase === "waiting") {
+    detail = `${run.s.length} step${run.s.length !== 1 ? "s" : ""} · ${duration(st.total)} total`;
+  } else if (st.phase === "done") {
+    detail = `ended ${duration(st.elapsed - st.total)} ago`;
+  } else {
+    detail = `Step ${st.step + 1} of ${run.s.length} · ${duration(st.stepEnd - st.elapsed)} left in this step`;
+  }
+
+  const rows = run.s.map((s, i) => {
+    const cls = st.step === i && st.phase !== "done" && st.phase !== "waiting"
+      ? "now" : (st.elapsed >= s[2] ? "past" : "");
+    const at = new Date(st.start.getTime() + s[2] * 60000);
+    return `<tr class="${cls}"><td>${i + 1}. ${escape(s[4] || "step " + (i + 1))}</td>
+      <td class="r">${fmtC(s[3])}</td><td class="r">${clockWithDay(at, st.start)}</td></tr>`;
+  }).join("");
+
+  const features = run.f.length ? `
+    <div class="card"><table><thead><tr><th>Feature</th><th class="r">At</th></tr></thead><tbody>
+      ${run.f.map(f => {
+        const at = new Date(st.start.getTime() + f[0] * 60000);
+        const temp = f[3] ? " · " + fmtC(setpointAt(run.p, f[0])) : "";
+        return `<tr class="${st.elapsed >= f[0] ? "past" : ""}">
+          <td><span class="dot" style="background:${f[2] || "var(--cool)"}"></span>${escape(f[1] || "unnamed")}${temp}</td>
+          <td class="r">${clockWithDay(at, st.start)}</td></tr>`;
+      }).join("")}</tbody></table></div>` : "";
+
+  const count = Object.keys(LIBRARY).length;
+  return `
+    <div class="row" style="margin-bottom:10px">
+      <button class="link" data-all="1">← All runs${count > 1 ? " (" + count + ")" : ""}</button>
+      <button class="x" data-remove="${id}" title="Remove this run">×</button>
+    </div>
+
+    <div class="card">
+      <h1>${escape(run.n || "Furnace program")}</h1>
+      <div class="sub">${clockWithDay(st.start, st.start)} → ${clockWithDay(st.end, st.start)} · ${duration(st.total)}</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <p class="phase">${escape(headline(st))}</p>
+        <div class="setpoint">${fmtC(st.setpoint)}</div>
+      </div>
+      <div class="bar"><i class="${barClass(st)}" style="width:${(st.fraction * 100).toFixed(1)}%"></i></div>
+      <div class="row sub"><span>${escape(detail)}</span>
+        <span>${st.phase === "done" ? "ended " + clockOf(st.end)
+                 : duration(Math.max(0, st.total - st.elapsed)) + " left"}</span></div>
+    </div>
+
+    <div class="card">${profileSvg(run, st.elapsed)}</div>
+
+    <div class="card"><table>
+      <thead><tr><th>Step</th><th class="r">Target</th><th class="r">Ends</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+
+    ${features}
+
+    <div class="card">
+      <label for="actual">Actually started at</label>
+      <input type="datetime-local" id="actual" value="${localValue(st.start)}">
+      <div style="margin-top:8px"><button id="reset">Back to the planned time</button></div>
+      <div class="sub" style="margin-top:8px">
+        Correct this if the furnace was switched on late; it is remembered on
+        this device only.
+      </div>
+    </div>`;
+}
+
+const localValue = d =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+// ------------------------------------------------------------------ shell
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = VIEW.mode === "run" ? runView(VIEW.id) : libraryView();
+
+  app.querySelectorAll("[data-open]").forEach(el =>
+    el.addEventListener("click", () => { VIEW = { mode: "run", id: el.dataset.open }; render(); }));
+
+  const all = app.querySelector("[data-all]");
+  if (all) all.addEventListener("click", () => { VIEW = { mode: "library" }; render(); });
+
+  const remove = app.querySelector("[data-remove]");
+  if (remove) remove.addEventListener("click", () => {
+    delete LIBRARY[remove.dataset.remove];
+    writeLibrary();
+    VIEW = { mode: "library" };
+    render();
+  });
+
+  const actual = app.querySelector("#actual");
+  if (actual) actual.addEventListener("change", e => {
+    const when = new Date(e.target.value);
+    if (!isNaN(when) && LIBRARY[VIEW.id]) {
+      LIBRARY[VIEW.id].offset = Math.floor(when.getTime() / 1000);
+      writeLibrary(); render();
+    }
+  });
+
+  const reset = app.querySelector("#reset");
+  if (reset) reset.addEventListener("click", () => {
+    if (LIBRARY[VIEW.id]) { LIBRARY[VIEW.id].offset = null; writeLibrary(); render(); }
+  });
+}
+
+function fail(message) {
+  document.getElementById("app").innerHTML =
+    `<div class="card empty"><p class="warn">${escape(message)}</p>
+     <p class="sub">Open the link from KILN again, or rescan the code.</p></div>`;
+}
+
+(async function start() {
+  LIBRARY = readLibrary();
+  forgetStale();
+
+  const fragment = location.hash;
+  if (fragment && fragment.length > 1) {
+    let run;
+    try { run = await decodeFragment(fragment); }
+    catch (e) { return fail("This link is damaged and cannot be read."); }
+    if (!run) return fail("This link carries no run.");
+    if (run.v !== 1) return fail("This link was made by a newer version of KILN.");
+
+    const id = idOf(fragment.replace(/^#/, ""));
+    LIBRARY[id] = { run, offset: (LIBRARY[id] || {}).offset || null, added: Date.now() / 1000 };
+    writeLibrary();
+    VIEW = { mode: "run", id };
+  }
+
+  render();
+  setInterval(render, 1000);
+})();
+</script>
+</body>
+</html>
