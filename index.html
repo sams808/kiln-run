@@ -81,19 +81,25 @@
          margin-right: 7px; vertical-align: baseline; }
   svg { display: block; width: 100%; height: auto; }
   label { font-size: .85rem; color: var(--muted); display: block; margin-bottom: 6px; }
+  /* 44px is the smallest touch target that is reliably hit on a phone; the
+     bare controls reach it with padding pulled back by a matching negative
+     margin, so the hit area grows without the text moving. */
   input[type=datetime-local] {
     font: inherit; font-size: .95rem; padding: 8px 10px; width: 100%;
+    min-height: 44px;
     border: 1px solid var(--line); border-radius: 9px;
     background: var(--bg); color: var(--ink);
   }
   button {
-    font: inherit; font-size: .9rem; padding: 8px 12px;
+    font: inherit; font-size: .9rem; padding: 8px 12px; min-height: 44px;
     border: 1px solid var(--line); border-radius: 9px;
     background: var(--bg); color: var(--ink); cursor: pointer;
   }
-  button.link { border: 0; background: none; color: var(--cool); padding: 4px 0; }
+  button.link { border: 0; background: none; color: var(--cool);
+                padding: 4px 10px; margin-left: -10px; }
   button.x { border: 0; background: none; color: var(--muted);
-             font-size: 1.3rem; line-height: 1; padding: 0 4px; }
+             font-size: 1.3rem; line-height: 1;
+             padding: 0 12px; min-width: 44px; margin-right: -12px; }
   .note { margin-top: 8px; padding: 8px 10px; border-radius: 9px;
           background: var(--bg); font-size: .9rem; }
   a.book { color: var(--cool); text-decoration: none; font-size: .9rem; }
@@ -321,10 +327,14 @@ let VIEW = { mode: "library" };
 
 function libraryView() {
   const ids = Object.keys(LIBRARY);
+  const addAll = `<div class="card"><button id="every">Show every furnace</button>
+      <div class="sub" style="margin-top:8px">Follows all the furnaces on the board,
+        so this page becomes what the whole lab is doing.</div></div>`;
   if (!ids.length) {
     return `<div class="card empty">
-      <p>No runs yet.</p>
-      <p class="sub">Scan the code KILN shows under<br><b>File ▸ Follow on your phone</b>.</p></div>`;
+      <p>Nothing followed yet.</p>
+      <p class="sub">Scan the code on a furnace, or the one KILN shows under
+        <b>File ▸ Follow on your phone</b>.</p></div>${addAll}`;
   }
   const entries = ids.map(id => ({ id, entry: LIBRARY[id], st: LIBRARY[id].run ? stateOf(LIBRARY[id]) : null }));
   // Soonest to finish first; idle furnaces and finished runs sink down.
@@ -357,9 +367,12 @@ function libraryView() {
       </div>
     </div>`).join("");
 
-  return `<h2>${entries.length} run${entries.length !== 1 ? "s" : ""}</h2>${cards}
-    <div class="card sub">Runs live on this device only, and are forgotten a day
-      after they finish. Open one to remove it sooner.</div>`;
+  const live = entries.filter(e => isLive(e.entry)).length;
+  const label = live === entries.length ? `${entries.length} furnace${entries.length !== 1 ? "s" : ""}`
+    : live ? `${entries.length} followed` : `${entries.length} run${entries.length !== 1 ? "s" : ""}`;
+  return `<h2>${label}</h2>${cards}${addAll}
+    <div class="card sub">Everything here lives on this device only. Scanned runs
+      are forgotten a day after they finish; furnaces stay until you remove them.</div>`;
 }
 
 function furnaceHeader(entry) {
@@ -499,16 +512,35 @@ function render() {
     }
   });
 
+  const every = app.querySelector("#every");
+  if (every) every.addEventListener("click", async () => {
+    every.disabled = true;
+    every.textContent = "Loading…";
+    let list = [];
+    try { list = await fetchFurnaceList(); } catch (e) { /* offline: leave as is */ }
+    for (const f of list) {
+      if (!LIBRARY[f.id]) {
+        LIBRARY[f.id] = { kind: "furnace", id: f.id, name: f.name || f.id, run: null,
+                          offset: null, by: "", at: 0, note: "",
+                          nemo: f.nemo_url || "", fetchedAt: 0 };
+      }
+    }
+    writeLibrary();
+    render();
+    refreshFurnaces();
+  });
+
   const reset = app.querySelector("#reset");
   if (reset) reset.addEventListener("click", () => {
     if (LIBRARY[VIEW.id]) { LIBRARY[VIEW.id].offset = null; writeLibrary(); render(); }
   });
 }
 
-function fail(message) {
+function fail(message, hint) {
+  const advice = hint || "Open the link from KILN again, or rescan the code.";
   document.getElementById("app").innerHTML =
     `<div class="card empty"><p class="warn">${escape(message)}</p>
-     <p class="sub">Open the link from KILN again, or rescan the code.</p></div>`;
+     <p class="sub">${escape(advice)}</p></div>`;
 }
 
 // Refresh every furnace being followed. A failure is not an error: the
@@ -551,6 +583,17 @@ async function followFurnace(id) {
   const fragment = location.hash;
 
   if (fragment && fragment.length > 1) {
+    // A run link is compressed, and DecompressionStream arrived in iOS 16.4
+    // (March 2023). Without this check an older iPhone is told the link is
+    // damaged and to rescan it, which can never help -- the link is fine.
+    // The furnace stickers do not compress anything and still work here.
+    if (typeof DecompressionStream === "undefined") {
+      return fail(
+        "This phone's browser is too old to open a run link.",
+        "It needs iOS 16.4 or later, or a current Chrome or Firefox. " +
+        "The QR sticker on the furnace itself works on older phones."
+      );
+    }
     let run;
     try { run = await decodeFragment(fragment); }
     catch (e) { return fail("This link is damaged and cannot be read."); }
